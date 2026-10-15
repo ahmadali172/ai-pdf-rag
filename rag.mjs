@@ -1,4 +1,5 @@
 import "dotenv/config";
+import fs from "node:fs";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
@@ -8,20 +9,57 @@ import {
   ChatGoogleGenerativeAI,
 } from "@langchain/google-genai";
 import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
+import { Document } from "@langchain/core/documents";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { StringOutputParser } from "@langchain/core/output_parsers";
 
-// 1. Load, split, embed and store the PDF
-const docs = await new PDFLoader("doc.pdf").load();
-const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 500,
-  chunkOverlap: 50,
-});
-const chunks = await splitter.splitDocuments(docs);
+const PDF_PATH = "doc.pdf";
+const CACHE_PATH = "vector-cache.json";
+
 const embeddings = new GoogleGenerativeAIEmbeddings({
   model: "gemini-embedding-001",
 });
-const vectorStore = await MemoryVectorStore.fromDocuments(chunks, embeddings);
+
+// 1. Build the vector store, or load it from the saved cache
+async function buildVectorStore() {
+  const stat = fs.statSync(PDF_PATH);
+  const pdfStamp = `${stat.size}-${stat.mtimeMs}`;
+
+  if (fs.existsSync(CACHE_PATH)) {
+    const cache = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+    if (cache.pdfStamp === pdfStamp) {
+      const store = new MemoryVectorStore(embeddings);
+      await store.addVectors(
+        cache.items.map((item) => item.embedding),
+        cache.items.map(
+          (item) =>
+            new Document({ pageContent: item.content, metadata: item.metadata })
+        )
+      );
+      console.log(`Loaded ${cache.items.length} chunks from cache.`);
+      return store;
+    }
+  }
+
+  const docs = await new PDFLoader(PDF_PATH).load();
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 500,
+    chunkOverlap: 50,
+  });
+  const chunks = await splitter.splitDocuments(docs);
+  const store = await MemoryVectorStore.fromDocuments(chunks, embeddings);
+
+  const items = store.memoryVectors.map((v) => ({
+    content: v.content,
+    embedding: v.embedding,
+    metadata: v.metadata,
+  }));
+  fs.writeFileSync(CACHE_PATH, JSON.stringify({ pdfStamp, items }));
+  console.log(`Embedded ${items.length} chunks and saved the cache.`);
+  return store;
+}
+
+const vectorStore = await buildVectorStore();
 
 // 2. The answering chain
 const model = new ChatGoogleGenerativeAI({
@@ -42,8 +80,6 @@ const chain = prompt.pipe(model).pipe(new StringOutputParser());
 // 3. Search + answer in one function
 async function ask(question) {
   const results = await vectorStore.similaritySearch(question, 6);
-  console.log("Retrieved:", results.map((r) => r.pageContent.slice(0, 50)));
-
   const context = results.map((r) => r.pageContent).join("\n\n");
   const answer = await chain.invoke({ context, question });
   const pages = [...new Set(results.map((r) => r.metadata.loc?.pageNumber))].sort(
