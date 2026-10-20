@@ -77,24 +77,66 @@ const prompt = ChatPromptTemplate.fromMessages([
 
 const chain = prompt.pipe(model).pipe(new StringOutputParser());
 
+// NEW: the notebook that saves old questions and answers
+const history = [];
+
+// NEW: the rewriter. Turns a short follow-up into a full question.
+const rewritePrompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "Rewrite the follow-up question so it makes sense alone. Use the chat history. If it already makes sense alone, return it unchanged. Output ONLY the question.",
+  ],
+  ["human", "History:\n{history}\n\nFollow-up: {question}"],
+]);
+
+const rewriteChain = rewritePrompt.pipe(model).pipe(new StringOutputParser());
+
 // 3. Search + answer in one function
 async function ask(question) {
-  const results = await vectorStore.similaritySearch(question, 6);
+  // NEW: rewrite the question if we have history
+  let standalone = question;
+
+  if (history.length > 0) {
+    const text = history
+      .map((h) => `User: ${h.question}\nAI: ${h.answer}`)
+      .join("\n\n");
+    standalone = (await rewriteChain.invoke({ history: text, question })).trim();
+  }
+
+  console.log("Searching for:", standalone); // NEW: so you can see the rewrite
+
+  // CHANGED: search with standalone instead of question
+  const results = await vectorStore.similaritySearch(standalone, 6);
   const context = results.map((r) => r.pageContent).join("\n\n");
-  const answer = await chain.invoke({ context, question });
+
+  // CHANGED: answer with standalone instead of question
+  const answer = await chain.invoke({ context, question: standalone });
+
   const pages = [...new Set(results.map((r) => r.metadata.loc?.pageNumber))].sort(
     (a, b) => a - b
   );
+
+  // NEW: save this turn in the notebook
+  history.push({ question, answer });
+
   return { answer, pages };
 }
 
 // 4. Chat loop
 const rl = readline.createInterface({ input, output });
-console.log('Ask questions about the handbook. Type "exit" to quit.\n');
+console.log('Ask questions about the handbook. Type "clear" to reset memory, "exit" to quit.\n');
 
 while (true) {
   const question = (await rl.question("You: ")).trim();
   if (question === "exit") break;
+
+  // NEW: clear command to wipe the notebook
+  if (question === "clear") {
+    history.length = 0;
+    console.log("Memory cleared.\n");
+    continue;
+  }
+
   if (!question) continue;
 
   try {
